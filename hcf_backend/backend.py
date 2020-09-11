@@ -66,13 +66,19 @@ If is consumer:
   For testing purposes or delegation of batch control.
 * HCF_CONSUMER_DELETE_BATCHES_ON_STOP - If given and True, read batches will be deleted when the job finishes.
     Default is to delete batches once read.
+* HCF_CONSUMER_USE_LOCK - Set to True if multiple spiders read from the same slot. It will avoid race conditions
+    on reading requests from the queue.
+* HCF_CONSUMER_WAIT_FOR_REQUEST - int, default 0. The consumer will wait this many seconds before shutting down
+    when there are no requests to consume.
 
 """
 
 import datetime
 import logging
+import time
 
 from frontera import Backend
+import requests as requests_lib
 from shub_workflow.utils import resolve_project_id
 
 from .manager import HCFManager
@@ -114,6 +120,9 @@ class HCFBackend(Backend):
         'HCF_CONSUMER_MAX_REQUESTS',
         'HCF_CONSUMER_DONT_DELETE_REQUESTS',
         'HCF_CONSUMER_DELETE_BATCHES_ON_STOP',
+
+        'HCF_CONSUMER_USE_LOCK',
+        'HCF_CONSUMER_WAIT_FOR_REQUEST',
     )
 
     component_name = 'HCF Backend'
@@ -139,6 +148,8 @@ class HCFBackend(Backend):
         self.hcf_consumer_max_requests = DEFAULT_HCF_CONSUMER_MAX_REQUESTS
         self.hcf_consumer_dont_delete_requests = False
         self.hcf_consumer_delete_batches_on_stop = False
+        self.hcf_consumer_use_lock = False
+        self.hcf_consumer_wait_for_request = 0
 
         self.stats = self.manager.settings.get('STATS_MANAGER')
 
@@ -149,7 +160,9 @@ class HCFBackend(Backend):
         self.consumer = None
 
         self.consumed_batches_ids = []
-        self._no_last_data = False
+        self._t_start_no_data = None
+
+        self.lock = None
 
     def frontier_start(self):
         for attr in self.backend_settings:
@@ -235,35 +248,47 @@ class HCFBackend(Backend):
         if self.producer is not None:
             self.producer.flush()
 
-        while data and len(return_requests) < n_min_requests and \
-                not (self._consumer_max_batches_reached() or self._consumer_max_requests_reached()):
-            data = False
-            for batch in self.consumer.read(self.hcf_consumer_slot, n_min_requests):
-                data = True
-                batch_id = batch['id']
-                if batch_id in self.consumed_batches_ids:
-                    return return_requests
-                requests = batch['requests']
-                self.stats.inc_value(self._get_consumer_stats_msg('requests'), len(requests))
-                for fingerprint, qdata in requests:
-                    self._convert_qdata_to_bytes(qdata)
-                    request = self._make_request(fingerprint, qdata)
-                    if request is not None:
-                        request.meta.update({
-                            b'created_at': datetime.datetime.utcnow(),
-                            b'depth': 0,
-                        })
-                        return_requests.append(request)
-                        self.n_consumed_requests += 1
-                self.consumed_batches_ids.append(batch_id)
-                self.n_consumed_batches += 1
-                self.stats.inc_value(self._get_consumer_stats_msg('batches'))
-                LOG.info('Reading %d request(s) from batch %s ', len(requests), batch_id)
+        if self.hcf_consumer_use_lock:
+            self.lock.acquire()  # blocking
+            LOG.debug('Acquired lock to read batches')
 
-            if not self.hcf_consumer_dont_delete_requests and not self.hcf_consumer_delete_batches_on_stop:
-                self.delete_read_batches()
+        try:
+            while data and len(return_requests) < n_min_requests and \
+                    not (self._consumer_max_batches_reached() or self._consumer_max_requests_reached()):
+                data = False
+                n_requests = []
+                for batch in self.consumer.read(self.hcf_consumer_slot, n_min_requests):
+                    data = True
+                    batch_id = batch['id']
+                    if batch_id in self.consumed_batches_ids:
+                        return return_requests
+                    requests = batch['requests']
+                    self.stats.inc_value(self._get_consumer_stats_msg('requests'), len(requests))
+                    for fingerprint, qdata in requests:
+                        self._convert_qdata_to_bytes(qdata)
+                        request = self._make_request(fingerprint, qdata)
+                        if request is not None:
+                            request.meta.update({
+                                b'created_at': datetime.datetime.utcnow(),
+                                b'depth': 0,
+                            })
+                            return_requests.append(request)
+                            self.n_consumed_requests += 1
+                    self.consumed_batches_ids.append(batch_id)
+                    self.n_consumed_batches += 1
+                    self.stats.inc_value(self._get_consumer_stats_msg('batches'))
+                    n_requests.append(len(requests))
 
-        self._no_last_data = not data
+                LOG.info('Reading %d requests from %d batches', sum(n_requests), len(n_requests))
+
+                if not self.hcf_consumer_dont_delete_requests and not self.hcf_consumer_delete_batches_on_stop:
+                    self.delete_read_batches()
+        finally:
+            if self.hcf_consumer_use_lock:
+                self.lock.release()
+
+        self._t_start_no_data = time.time() if not data and not self._t_start_no_data else None
+
         return return_requests
 
     def delete_read_batches(self):
@@ -336,6 +361,10 @@ class HCFBackend(Backend):
             self.consumer = HCFManager(auth=self.hcf_auth,
                                        project_id=self.hcf_project_id,
                                        frontier=self.hcf_consumer_frontier)
+            if self.hcf_consumer_use_lock:
+                lock_name = self.hcf_consumer_frontier + '_' + self.hcf_consumer_slot
+                self.lock = Locker(self.hcf_project_id, self.hcf_auth, lock_name)
+                LOG.info('Using lock "%s" while reading batches', lock_name)
 
     def hcf_get_producer_slot(self, request):
         """Determine to which slot should be saved the request.
@@ -368,4 +397,54 @@ class HCFBackend(Backend):
         pass
 
     def finished(self):
-        return self._no_last_data and (self.producer is None or self.producer.get_number_of_links_to_flush() == 0)
+        if (
+                self._t_start_no_data is not None
+                and (time.time() - self._t_start_no_data) > self.hcf_consumer_wait_for_request
+                and (self.producer is None or self.producer.get_number_of_links_to_flush() == 0)
+        ):
+            LOG.info('hcf backend is finished')
+            return True
+        return False
+
+
+class Locker:
+    """Simple lock for synchronization with other spiders, by abusing the Scrapinghub Collections API."""
+
+    def __init__(self, project_id, api_key, name):
+        self.url = 'https://storage.scrapinghub.com/collections/{}/s/{}'.format(project_id, name)
+        self.session = requests_lib.Session()
+        self.session.auth = (api_key, '')
+        # field must be set at the start
+        self.release()
+
+    def acquire(self):
+        i = 0
+        while True:
+            try:
+                resp = self.session.delete(self.url)
+                data = resp.json()
+                assert 'deleted' in data
+            except Exception:
+                LOG.error('error while waiting to acquire lock, continuing', exc_info=True)
+                break
+            else:
+                if data['deleted'] > 0:
+                    break
+            if i >= 10:
+                LOG.warning('Waiting for lock took too long, continuing')
+                break
+            time.sleep(2 + i)
+            i += 1
+
+    def release(self):
+        i = 1
+        while True:
+            try:
+                resp = self.session.post(self.url, json={'_key': 'lock', 'value': 'free'})
+                resp.raise_for_status()
+            except Exception:
+                LOG.error('error while releasing lock, trying again', exc_info=True)
+                time.sleep(i * 2)
+                i += 1
+            else:
+                break
