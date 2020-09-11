@@ -66,11 +66,14 @@ If is consumer:
   For testing purposes or delegation of batch control.
 * HCF_CONSUMER_DELETE_BATCHES_ON_STOP - If given and True, read batches will be deleted when the job finishes.
     Default is to delete batches once read.
+* HCF_CONSUMER_WAIT_FOR_REQUEST - int, default 0. The consumer will wait this many seconds before shutting down
+    when there are no requests to consume.
 
 """
 
 import datetime
 import logging
+import time
 
 from frontera import Backend
 from shub_workflow.utils import resolve_project_id
@@ -114,6 +117,7 @@ class HCFBackend(Backend):
         'HCF_CONSUMER_MAX_REQUESTS',
         'HCF_CONSUMER_DONT_DELETE_REQUESTS',
         'HCF_CONSUMER_DELETE_BATCHES_ON_STOP',
+        'HCF_CONSUMER_WAIT_FOR_REQUEST',
     )
 
     component_name = 'HCF Backend'
@@ -139,6 +143,7 @@ class HCFBackend(Backend):
         self.hcf_consumer_max_requests = DEFAULT_HCF_CONSUMER_MAX_REQUESTS
         self.hcf_consumer_dont_delete_requests = False
         self.hcf_consumer_delete_batches_on_stop = False
+        self.hcf_consumer_wait_for_request = 0
 
         self.stats = self.manager.settings.get('STATS_MANAGER')
 
@@ -149,7 +154,7 @@ class HCFBackend(Backend):
         self.consumer = None
 
         self.consumed_batches_ids = []
-        self._no_last_data = False
+        self._t_start_no_data = None
 
     def frontier_start(self):
         for attr in self.backend_settings:
@@ -266,7 +271,8 @@ class HCFBackend(Backend):
             if not self.hcf_consumer_dont_delete_requests and not self.hcf_consumer_delete_batches_on_stop:
                 self.delete_read_batches()
 
-        self._no_last_data = not data
+        self._t_start_no_data = time.time() if not data and not self._t_start_no_data else None
+
         return return_requests
 
     def delete_read_batches(self):
@@ -371,4 +377,11 @@ class HCFBackend(Backend):
         pass
 
     def finished(self):
-        return self._no_last_data and (self.producer is None or self.producer.get_number_of_links_to_flush() == 0)
+        if (
+                self._t_start_no_data is not None
+                and (time.time() - self._t_start_no_data) > self.hcf_consumer_wait_for_request
+                and (self.producer is None or self.producer.get_number_of_links_to_flush() == 0)
+        ):
+            LOG.info('hcf backend is finished')
+            return True
+        return False
