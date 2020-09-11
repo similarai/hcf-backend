@@ -238,6 +238,7 @@ class HCFBackend(Backend):
         while data and len(return_requests) < n_min_requests and \
                 not (self._consumer_max_batches_reached() or self._consumer_max_requests_reached()):
             data = False
+            n_requests = []
             for batch in self.consumer.read(self.hcf_consumer_slot, n_min_requests):
                 data = True
                 batch_id = batch['id']
@@ -258,7 +259,9 @@ class HCFBackend(Backend):
                 self.consumed_batches_ids.append(batch_id)
                 self.n_consumed_batches += 1
                 self.stats.inc_value(self._get_consumer_stats_msg('batches'))
-                LOG.info('Reading %d request(s) from batch %s ', len(requests), batch_id)
+                n_requests.append(len(requests))
+
+            LOG.info('Reading %d requests from %d batches', sum(n_requests), len(n_requests))
 
             if not self.hcf_consumer_dont_delete_requests and not self.hcf_consumer_delete_batches_on_stop:
                 self.delete_read_batches()
